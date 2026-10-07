@@ -4,9 +4,9 @@ main = "build/index.js"
 
 [vars]
 # 生产环境环境变量
-TG_Bot_Token = "8859657937:AAGo-u8oMjjXV-257hvBAkLxXBPffbjNzec"
-TG_Chat_ID = "-1002509744447"
-JWT_SECRET = "laowang-hardcore-jwt-secret-key-9527"
+TG_Bot_Token = "8959603165:AAH89c580wvqgIOsvms9NfhV7OQzbYNwA-Y"
+TG_Chat_ID = "-1004363173872"
+JWT_SECRET = "AW7492BNCA*bc2"
 # 图片状态管理开关（默认关闭 = 纯图床模式：上传后永久托管，访问路径零状态校验）
 # 设为 "on" 时启用封禁/回收站拦截与点击统计（每次访问需查 D1 状态）
 FILE_STATUS_CHECK = "off"
@@ -14,7 +14,7 @@ FILE_STATUS_CHECK = "off"
 [[d1_databases]]
 binding = "DB"
 database_name = "image"
-database_id = "484dd7ca-eb1f-41bf-b913-9b1edcc36da1"
+database_id = "9bcbb2bd-473f-43f6-bdda-75099b59fede"
 
 [build]
 command = "node build-platform.js"
