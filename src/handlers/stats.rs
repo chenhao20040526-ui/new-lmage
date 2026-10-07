@@ -54,7 +54,7 @@ pub async fn get_user_stats(req: Request, env: Env) -> Result<Response> {
     let headers = cors::apply_cors(Headers::new())?;
     headers.set("Content-Type", "application/json")?;
 
-    let quota_limit_bytes = 10.0 * 1024.0 * 1024.0 * 1024.0;
+    let quota_limit_bytes = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
     let response = Response::from_json(&serde_json::json!({
         "stats": {
