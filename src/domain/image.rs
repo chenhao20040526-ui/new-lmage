@@ -37,25 +37,29 @@ pub struct BatchImageTagRequest {
 
 pub async fn create(db: &D1Database, img: &Image) -> Result<()> {
     db.prepare(
-        "INSERT INTO images (id, file_id, file_name, file_size, mime_type, user_id, album_id, message_id, thumb_file_id, views, last_accessed_at, is_trash, is_blocked, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        // 👇 检查：这里一共声明了 15 个字段，VALUES 后面是 15 个问号 ?
+        "INSERT INTO images (
+            id, file_id, file_name, file_size, mime_type, 
+            user_id, album_id, message_id, chat_id, thumb_file_id, 
+            views, last_accessed_at, is_trash, is_blocked, uploaded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&[
-        img.id.as_str().into(),
-        img.file_id.as_str().into(),
-        img.file_name.as_str().into(),
-        int_i64(img.file_size),
-        img.mime_type.as_str().into(),
-        img.user_id.as_str().into(),
-        opt_str(img.album_id.as_deref()),
-        opt_i64(img.message_id),
-        opt_str(img.chat_id.as_deref()), // 👈 新增此绑定
-        opt_str(img.thumb_file_id.as_deref()),
-        int_i64(img.views),
-        opt_i64(img.last_accessed_at),
-        img.is_trash.into(),
-        img.is_blocked.into(),
-        int_i64(img.uploaded_at),
+        img.id.as_str().into(),                 // 1. id
+        img.file_id.as_str().into(),           // 2. file_id
+        img.file_name.as_str().into(),         // 3. file_name
+        int_i64(img.file_size),                // 4. file_size
+        img.mime_type.as_str().into(),         // 5. mime_type
+        img.user_id.as_str().into(),           // 6. user_id
+        opt_str(img.album_id.as_deref()),      // 7. album_id
+        opt_i64(img.message_id),               // 8. message_id
+        opt_str(img.chat_id.as_deref()),       // 9. chat_id (👈 核心新增)
+        opt_str(img.thumb_file_id.as_deref()), // 10. thumb_file_id
+        int_i64(img.views),                    // 11. views
+        opt_i64(img.last_accessed_at),         // 12. last_accessed_at
+        img.is_trash.into(),                   // 13. is_trash
+        img.is_blocked.into(),                 // 14. is_blocked
+        int_i64(img.uploaded_at),              // 15. uploaded_at
     ])?
     .run()
     .await?;
