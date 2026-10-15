@@ -125,9 +125,9 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
 
 // 2. 物理永久彻底删除
 pub async fn delete_file(req: Request, env: Env, imageid: String) -> Result<Response> {
-    let db = env.d1("DB")?;
-    let bot_token = env.var("TG_Bot_Token")?.to_string();
-    let chat_id = env.var("TG_Chat_ID")?.to_string();
+let db = env.d1("DB")?;
+    let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
+    let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
     let jwt_secret = env.var("JWT_SECRET")?.to_string();
 
     let claims = match crypto::authenticate(&req, &jwt_secret) {
@@ -145,9 +145,14 @@ pub async fn delete_file(req: Request, env: Env, imageid: String) -> Result<Resp
         return Response::error("无权操作此资源", 403);
     }
 
-    // 1) 彻底在 TG 频道销毁消息
+    // 1) 彻底在 TG 频道销毁消息（优先读取数据库存的亲生频道）
     if let Some(msg_id) = img.message_id {
-        let _ = tg::delete_message(&bot_token, &chat_id, msg_id).await;
+        let target_chat_id = img.chat_id.as_deref().unwrap_or_else(|| {
+            env.var("TG_Chat_ID").ok().as_deref().and_then(|s| s.split(',').next()).unwrap_or("")
+        });
+        if !target_chat_id.is_empty() {
+            let _ = tg::delete_message(&bot_token, target_chat_id, msg_id).await;
+        }
     }
 
     // 2) 清掉边缘缓存（原图 + 缩略图），防止已删图片被缓存继续吐给用户
