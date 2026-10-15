@@ -55,22 +55,16 @@ async fn enforce_guest_rate_limit(db: &D1Database) -> Result<()> {
 
 pub async fn upload(mut req: Request, env: Env) -> Result<Response> {
     let db = env.d1("DB")?;
+// 1) 提取单个主 Bot Token
 let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
+let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
+
+// 2) 提取多频道列表并随机抽取一个
 let raw_chat_id = env.var("TG_Chat_ID")?.to_string();
-
-let tokens: Vec<&str> = raw_bot_token.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
 let chat_ids: Vec<&str> = raw_chat_id.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-
-// 生成唯一随机索引，保证 Bot 与 Channel 绑定配对
-let rand_index = if !tokens.is_empty() {
-    (js_sys::Math::random() * tokens.len() as f64) as usize
-} else {
-    0
-};
-
-let bot_token = tokens.get(rand_index).unwrap_or(&raw_bot_token.as_str()).to_string();
 let chat_id = if !chat_ids.is_empty() {
-    chat_ids[rand_index % chat_ids.len()].to_string()
+    let rand_channel_index = (js_sys::Math::random() * chat_ids.len() as f64) as usize;
+    chat_ids[rand_channel_index].to_string()
 } else {
     raw_chat_id
 };
@@ -153,6 +147,7 @@ let chat_id = if !chat_ids.is_empty() {
         user_id,
         album_id,
         message_id: Some(message_id),
+        chat_id: Some(chat_id.clone()), // 👈 存入当时发往的频道 ID
         thumb_file_id,
         views: 0,
         last_accessed_at: None,
