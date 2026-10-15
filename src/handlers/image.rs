@@ -152,9 +152,9 @@ pub async fn search_user_images(req: Request, env: Env) -> Result<Response> {
 
 // 4. 批量物理永久删除（纯图床模式：删除即永久，无回收站概念）
 pub async fn batch_permanent_delete(mut req: Request, env: Env) -> Result<Response> {
-    let db = env.d1("DB")?;
-    let bot_token = env.var("TG_Bot_Token")?.to_string();
-    let chat_id = env.var("TG_Chat_ID")?.to_string();
+let db = env.d1("DB")?;
+    let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
+    let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
     let jwt_secret = env.var("JWT_SECRET")?.to_string();
     let claims = match crypto::authenticate(&req, &jwt_secret) {
         Ok(c) => c,
@@ -183,9 +183,14 @@ pub async fn batch_permanent_delete(mut req: Request, env: Env) -> Result<Respon
         // D1 存完整 id（纯 file_id + 后缀），查询与写入都用完整 id
         if let Ok(Some(img)) = image::get_by_id(&db, &full_id).await {
             if img.user_id == claims.sub || claims.username == "admin" {
-                // 1) 销毁 TG 频道原始消息
+                // 1) 销毁 TG 频道原始消息（优先读取数据库存的亲生频道）
                 if let Some(msg_id) = img.message_id {
-                    let _ = tg::delete_message(&bot_token, &chat_id, msg_id).await;
+                    let target_chat_id = img.chat_id.as_deref().unwrap_or_else(|| {
+                        env.var("TG_Chat_ID").ok().as_deref().and_then(|s| s.split(',').next()).unwrap_or("")
+                    });
+                    if !target_chat_id.is_empty() {
+                        let _ = tg::delete_message(&bot_token, target_chat_id, msg_id).await;
+                    }
                 }
                 // 2) 清边缘缓存（原图 + 缩略图），防止已删图片被缓存继续吐给用户
                 if let Some(ref origin) = origin {
