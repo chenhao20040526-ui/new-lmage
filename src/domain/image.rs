@@ -38,7 +38,7 @@ pub struct BatchImageTagRequest {
 pub async fn create(db: &D1Database, img: &Image) -> Result<()> {
     db.prepare(
         "INSERT INTO images (id, file_id, file_name, file_size, mime_type, user_id, album_id, message_id, thumb_file_id, views, last_accessed_at, is_trash, is_blocked, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&[
         img.id.as_str().into(),
