@@ -48,6 +48,7 @@ pub async fn create(db: &D1Database, img: &Image) -> Result<()> {
         img.user_id.as_str().into(),
         opt_str(img.album_id.as_deref()),
         opt_i64(img.message_id),
+        opt_str(img.chat_id.as_deref()), // 👈 新增此绑定
         opt_str(img.thumb_file_id.as_deref()),
         int_i64(img.views),
         opt_i64(img.last_accessed_at),
