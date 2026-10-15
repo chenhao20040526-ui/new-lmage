@@ -56,18 +56,24 @@ async fn enforce_guest_rate_limit(db: &D1Database) -> Result<()> {
 pub async fn upload(mut req: Request, env: Env) -> Result<Response> {
     let db = env.d1("DB")?;
 let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
-let tokens: Vec<&str> = raw_bot_token
-    .split(',')
-    .map(|s| s.trim())
-    .filter(|s| !s.is_empty())
-    .collect();
-let bot_token = if !tokens.is_empty() {
-    let rand_index = (js_sys::Math::random() * tokens.len() as f64) as usize;
-    tokens[rand_index].to_string()
+let raw_chat_id = env.var("TG_Chat_ID")?.to_string();
+
+let tokens: Vec<&str> = raw_bot_token.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+let chat_ids: Vec<&str> = raw_chat_id.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+// 生成唯一随机索引，保证 Bot 与 Channel 绑定配对
+let rand_index = if !tokens.is_empty() {
+    (js_sys::Math::random() * tokens.len() as f64) as usize
 } else {
-    raw_bot_token
+    0
 };
-    let chat_id = env.var("TG_Chat_ID")?.to_string();
+
+let bot_token = tokens.get(rand_index).unwrap_or(&raw_bot_token.as_str()).to_string();
+let chat_id = if !chat_ids.is_empty() {
+    chat_ids[rand_index % chat_ids.len()].to_string()
+} else {
+    raw_chat_id
+};
     let jwt_secret = env.var("JWT_SECRET")?.to_string();
 
     // 1. 鉴权判定 (可选)
