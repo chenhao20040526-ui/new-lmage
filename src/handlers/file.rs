@@ -146,10 +146,13 @@ let db = env.d1("DB")?;
     }
 
     // 1) 彻底在 TG 频道销毁消息（优先读取数据库存的亲生频道）
-    if let Some(msg_id) = img.message_id {
-        let target_chat_id = img.chat_id.as_deref().unwrap_or_else(|| {
-            env.var("TG_Chat_ID").ok().as_deref().and_then(|s| s.split(',').next()).unwrap_or("")
-        });
+if let Some(msg_id) = img.message_id {
+        let fallback_chat = env.var("TG_Chat_ID")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let fallback_first = fallback_chat.split(',').next().unwrap_or("").to_string();
+
+        let target_chat_id = img.chat_id.as_deref().unwrap_or(&fallback_first);
         if !target_chat_id.is_empty() {
             let _ = tg::delete_message(&bot_token, target_chat_id, msg_id).await;
         }
