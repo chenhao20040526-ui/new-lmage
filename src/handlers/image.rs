@@ -184,14 +184,17 @@ let db = env.d1("DB")?;
         if let Ok(Some(img)) = image::get_by_id(&db, &full_id).await {
             if img.user_id == claims.sub || claims.username == "admin" {
                 // 1) 销毁 TG 频道原始消息（优先读取数据库存的亲生频道）
-                if let Some(msg_id) = img.message_id {
-                    let target_chat_id = img.chat_id.as_deref().unwrap_or_else(|| {
-                        env.var("TG_Chat_ID").ok().as_deref().and_then(|s| s.split(',').next()).unwrap_or("")
-                    });
-                    if !target_chat_id.is_empty() {
-                        let _ = tg::delete_message(&bot_token, target_chat_id, msg_id).await;
-                    }
-                }
+if let Some(msg_id) = img.message_id {
+        let fallback_chat = env.var("TG_Chat_ID")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let fallback_first = fallback_chat.split(',').next().unwrap_or("").to_string();
+
+        let target_chat_id = img.chat_id.as_deref().unwrap_or(&fallback_first);
+        if !target_chat_id.is_empty() {
+            let _ = tg::delete_message(&bot_token, target_chat_id, msg_id).await;
+        }
+    }
                 // 2) 清边缘缓存（原图 + 缩略图），防止已删图片被缓存继续吐给用户
                 if let Some(ref origin) = origin {
                     for suffix in ["", "?size=thumb"] {
