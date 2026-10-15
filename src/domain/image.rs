@@ -15,6 +15,7 @@ pub struct Image {
     pub user_id: String,
     pub album_id: Option<String>,
     pub message_id: Option<i64>,
+    pub chat_id: Option<String>, // 👈 补上这个缺失的字段，报错 1/2 解决！
     pub thumb_file_id: Option<String>,
     pub views: i64,
     pub last_accessed_at: Option<i64>,
