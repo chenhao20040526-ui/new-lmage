@@ -56,7 +56,7 @@ pub async fn init_db(db: &D1Database) -> Result<()> {
 
     // 3. 创建图片表 (加入缩略图 file_id、点击统计、最后访问统计字段)
     db.prepare(
-        "CREATE TABLE IF NOT EXISTS images (
+"CREATE TABLE IF NOT EXISTS images (
             id TEXT PRIMARY KEY,
             file_id TEXT NOT NULL,
             file_name TEXT NOT NULL,
@@ -65,6 +65,7 @@ pub async fn init_db(db: &D1Database) -> Result<()> {
             user_id TEXT NOT NULL,
             album_id TEXT,
             message_id INTEGER,
+            chat_id TEXT,
             thumb_file_id TEXT,
             views INTEGER DEFAULT 0,
             last_accessed_at INTEGER,
@@ -138,11 +139,12 @@ async fn migrate(db: &D1Database) -> Result<()> {
                 ("password_hash", "TEXT"),
             ],
         ),
-        (
+(
             "images",
             &[
                 ("album_id", "TEXT"),
                 ("message_id", "INTEGER"),
+                ("chat_id", "TEXT"),
                 ("thumb_file_id", "TEXT"),
                 ("views", "INTEGER DEFAULT 0"),
                 ("last_accessed_at", "INTEGER"),
