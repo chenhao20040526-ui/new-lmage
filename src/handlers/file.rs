@@ -76,7 +76,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     };
 
     // 2) 调取真实流
-    let cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
+let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
 
     // 3) 注入强缓存，Cloudflare Cache API 必须携带 max-age 才能缓存成功！
     let res_headers = cors::apply_cors(Headers::new())?;
