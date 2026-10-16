@@ -5,12 +5,9 @@ use worker::*;
 // 1. 流式图片代理网关（打通 Cloudflare Cache API 全球边缘节点物理缓存，多尺寸缩略图）
 pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Response> {
     let db = env.d1("DB")?;
-    let bot_token = env.var("TG_Bot_Token")?.to_string();
+    let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
+    let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
 
-    // ⚡ 状态管理开关（默认关闭 = 纯图床模式）：
-    // - off：上传后完全不管，图片访问路径零状态校验、零点击统计写入，
-    //   仅按需读取缩略图元数据（30s 内存缓存 + 365 天边缘缓存吸收，实际趋近零查询）
-    // - on：执行封禁/回收站校验（校验必须先于缓存检查，防绕过）与点击统计
     let status_check_on = env
         .var("FILE_STATUS_CHECK")
         .map(|v| v.to_string().eq_ignore_ascii_case("on"))
@@ -47,7 +44,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // size=thumb 缩略图快速白嫖（两种模式均支持：复用 TG 自动缩略图省流量）
+    // size=thumb 缩略图快速白嫖：完美保留！
     if let Some(ref img) = img_opt {
         let url = req.url()?;
         let query = url.query_pairs();
@@ -66,10 +63,9 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // ⚡ 极致白嫖：第一关，尝试直接从 Cloudflare 边缘物理缓存中拿！
+    // ⚡ 第一关：从 Cloudflare 边缘物理缓存中拿（完美保留！）
     let cache_key = req.url()?.to_string();
     if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
-        // 🚀 物理秒开击中：直接跳过 TG CDN 穿透，零时延输出！
         return Ok(cached_resp);
     }
 
@@ -80,7 +76,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     };
 
     // 2) 调取真实流
-    let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
+    let cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
 
     // 3) 注入强缓存，Cloudflare Cache API 必须携带 max-age 才能缓存成功！
     let res_headers = cors::apply_cors(Headers::new())?;
@@ -103,16 +99,17 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     };
     res_headers.set("Content-Type", mime_type)?;
 
-    // 4) 物理流写入成功后，累计 Views (仅状态管理开启时统计，纯图床模式零写入)
+    // 4) 累计 Views
     if status_check_on && img_opt.is_some() {
         let now = Date::now().as_millis() as i64;
         let _ = image::increment_views(&db, &raw_file_id, now).await;
     }
 
-    let bytes = cdn_resp.bytes().await?;
-    let mut response = Response::from_bytes(bytes)?.with_headers(res_headers);
+    // 🚀 核心优化点：直接用 Response 包装 TG 返回的 stream()，不再加载整个 bytes 到内存！
+    let stream = cdn_resp.stream()?;
+    let mut response = Response::from_stream(stream)?.with_headers(res_headers);
 
-    // ⚡ 极致白嫖：将流克隆一份，异步在后台写入 Cloudflare Cache 节点，不阻塞当前响应输出！
+    // 将响应克隆并写入 Cloudflare 物理边缘 Cache
     if let Ok(resp_for_cache) = response.cloned() {
         let cache_key_clone = cache_key.clone();
         wasm_bindgen_futures::spawn_local(async move {
