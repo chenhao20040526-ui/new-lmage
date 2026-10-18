@@ -2,12 +2,16 @@ use crate::core::{cors, crypto, tg};
 use crate::domain::image;
 use worker::*;
 
-// 1. 流式图片代理网关（打通 Cloudflare Cache API 全球边缘节点物理缓存，多尺寸缩略图）
+// 1. 图片代理网关（原图 302 直连 Telegram CDN，缩略图走 Cloudflare Cache API 物理缓存）
 pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Response> {
     let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
     let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
 
+    // ⚡ 状态管理开关（默认关闭 = 纯图床模式）：
+    // - off：上传后完全不管，图片访问路径零状态校验、零点击统计写入，
+    //   仅按需读取缩略图元数据（30s 内存缓存 + 365 天边缘缓存吸收，实际趋近零查询）
+    // - on：执行封禁/回收站校验（校验必须先于缓存检查，防绕过）与点击统计
     let status_check_on = env
         .var("FILE_STATUS_CHECK")
         .map(|v| v.to_string().eq_ignore_ascii_case("on"))
@@ -45,40 +49,53 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     }
 
     // size=thumb 缩略图快速白嫖：完美保留！
-    if let Some(ref img) = img_opt {
-        let url = req.url()?;
-        let query = url.query_pairs();
-        let mut request_thumb = false;
-        for (k, v) in query {
-            if k == "size" && v == "thumb" {
-                request_thumb = true;
-                break;
-            }
+    let url = req.url()?;
+    let mut request_thumb = false;
+    for (k, v) in url.query_pairs() {
+        if k == "size" && v == "thumb" {
+            request_thumb = true;
+            break;
         }
+    }
 
-        if request_thumb {
+    if request_thumb {
+        if let Some(ref img) = img_opt {
             if let Some(ref thumb_id) = img.thumb_file_id {
                 target_file_id = thumb_id.clone();
             }
         }
     }
 
-    // ⚡ 第一关：从 Cloudflare 边缘物理缓存中拿（完美保留！）
-    let cache_key = req.url()?.to_string();
-    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
-        return Ok(cached_resp);
-    }
-
-    // 1) 换取物理路径
+    // 1) 向 TG 换取物理路径
     let file_path = match tg::get_file_path(&bot_token, &target_file_id).await {
         Ok(path) => path,
         Err(err) => return Response::error(err.to_string(), 404),
     };
 
-    // 2) 调取真实流
-let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
+    // 2) 组装 TG 官方 CDN 真实直链地址
+    let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
 
-    // 3) 注入强缓存，Cloudflare Cache API 必须携带 max-age 才能缓存成功！
+    // 🚀 核心改动：如果是原图请求（非 thumb），直接返回 302 重定向给客户端，彻底消除中转断流与卡死！
+    if !request_thumb {
+        // 累计 Views (仅状态管理开启时统计)
+        if status_check_on && img_opt.is_some() {
+            let now = Date::now().as_millis() as i64;
+            let _ = image::increment_views(&db, &raw_file_id, now).await;
+        }
+
+        let mut headers = cors::apply_cors(Headers::new())?;
+        headers.set("Location", &tg_file_url)?;
+        headers.set("Cache-Control", "public, max-age=86400, s-maxage=86400")?; // 24小时边缘重定向缓存
+        return Ok(Response::empty()?.with_headers(headers).with_status(302));
+    }
+
+    // ⚡ 对于缩略图（size=thumb），依然完美保留你的 Cloudflare 边缘物理缓存机制！
+    let cache_key = req.url()?.to_string();
+    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
+        return Ok(cached_resp);
+    }
+
+    let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
     let res_headers = cors::apply_cors(Headers::new())?;
     res_headers.set(
         "Cache-Control",
@@ -99,17 +116,9 @@ let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
     };
     res_headers.set("Content-Type", mime_type)?;
 
-    // 4) 累计 Views
-    if status_check_on && img_opt.is_some() {
-        let now = Date::now().as_millis() as i64;
-        let _ = image::increment_views(&db, &raw_file_id, now).await;
-    }
-
-    // 🚀 核心优化点：直接用 Response 包装 TG 返回的 stream()，不再加载整个 bytes 到内存！
     let stream = cdn_resp.stream()?;
     let mut response = Response::from_stream(stream)?.with_headers(res_headers);
 
-    // 将响应克隆并写入 Cloudflare 物理边缘 Cache
     if let Ok(resp_for_cache) = response.cloned() {
         let cache_key_clone = cache_key.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -120,9 +129,9 @@ let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
     Ok(response)
 }
 
-// 2. 物理永久彻底删除
+// 2. 物理永久彻底删除（原封不动保留你的逻辑）
 pub async fn delete_file(req: Request, env: Env, imageid: String) -> Result<Response> {
-let db = env.d1("DB")?;
+    let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
     let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
     let jwt_secret = env.var("JWT_SECRET")?.to_string();
@@ -132,7 +141,6 @@ let db = env.d1("DB")?;
         Err(err) => return Response::error(err.to_string(), 401),
     };
 
-    // D1 存完整 id（纯 file_id + 后缀），直接用完整 imageid 查询
     let img = match image::get_by_id(&db, &imageid).await? {
         Some(i) => i,
         None => return Response::error("图片不存在", 404),
@@ -142,8 +150,7 @@ let db = env.d1("DB")?;
         return Response::error("无权操作此资源", 403);
     }
 
-    // 1) 彻底在 TG 频道销毁消息（优先读取数据库存的亲生频道）
-if let Some(msg_id) = img.message_id {
+    if let Some(msg_id) = img.message_id {
         let fallback_chat = env.var("TG_Chat_ID")
             .map(|v| v.to_string())
             .unwrap_or_default();
@@ -155,7 +162,6 @@ if let Some(msg_id) = img.message_id {
         }
     }
 
-    // 2) 清掉边缘缓存（原图 + 缩略图），防止已删图片被缓存继续吐给用户
     if let Ok(url) = req.url() {
         let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
         for suffix in ["", "?size=thumb"] {
@@ -164,10 +170,7 @@ if let Some(msg_id) = img.message_id {
         }
     }
 
-    // 3) 彻底从 D1 清理元数据
     image::delete_physically(&db, &imageid).await?;
-
-    // 4) 失效内存状态缓存（物理删除即时生效，不留幽灵缓存）
     crate::core::img_cache::invalidate(&imageid);
 
     let headers = cors::apply_cors(Headers::new())?;
