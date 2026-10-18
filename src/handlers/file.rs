@@ -2,16 +2,12 @@ use crate::core::{cors, crypto, tg};
 use crate::domain::image;
 use worker::*;
 
-// 1. 图片代理网关（原图 302 直连 Telegram CDN，缩略图走 Cloudflare Cache API 物理缓存）
+// 1. 图片代理网关（原图 302 直连 Telegram CDN + 强制内联预览，缩略图走 Cache API）
 pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Response> {
     let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
     let bot_token = raw_bot_token.split(',').next().unwrap_or(&raw_bot_token).trim().to_string();
 
-    // ⚡ 状态管理开关（默认关闭 = 纯图床模式）：
-    // - off：上传后完全不管，图片访问路径零状态校验、零点击统计写入，
-    //   仅按需读取缩略图元数据（30s 内存缓存 + 365 天边缘缓存吸收，实际趋近零查询）
-    // - on：执行封禁/回收站校验（校验必须先于缓存检查，防绕过）与点击统计
     let status_check_on = env
         .var("FILE_STATUS_CHECK")
         .map(|v| v.to_string().eq_ignore_ascii_case("on"))
@@ -33,7 +29,6 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     };
 
     if status_check_on {
-        // 状态校验模式：封禁/回收站必须立即生效
         if let Some(ref img) = img_opt {
             if img.is_blocked == 1 {
                 let headers = cors::apply_cors(Headers::new())?;
@@ -48,7 +43,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // size=thumb 缩略图快速白嫖：完美保留！
+    // 检查是否请求缩略图 (?size=thumb)
     let url = req.url()?;
     let mut request_thumb = false;
     for (k, v) in url.query_pairs() {
@@ -75,9 +70,8 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     // 2) 组装 TG 官方 CDN 真实直链地址
     let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
 
-    // 🚀 核心改动：如果是原图请求（非 thumb），直接返回 302 重定向给客户端，彻底消除中转断流与卡死！
+    // 🚀 核心优化：原图请求直接 302 重定向到 Telegram CDN，彻底解决中转断流、半截图与 CPU 超时！
     if !request_thumb {
-        // 累计 Views (仅状态管理开启时统计)
         if status_check_on && img_opt.is_some() {
             let now = Date::now().as_millis() as i64;
             let _ = image::increment_views(&db, &raw_file_id, now).await;
@@ -85,11 +79,29 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
 
         let mut headers = cors::apply_cors(Headers::new())?;
         headers.set("Location", &tg_file_url)?;
-        headers.set("Cache-Control", "public, max-age=86400, s-maxage=86400")?; // 24小时边缘重定向缓存
+        headers.set("Cache-Control", "public, max-age=86400, s-maxage=86400")?;
+
+        // 动态匹配 Content-Type
+        let ext = filekey.split('.').last().unwrap_or("").to_lowercase();
+        let mime_type = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "mp4" => "video/mp4",
+            "mp3" => "audio/mpeg",
+            _ => "application/octet-stream",
+        };
+        headers.set("Content-Type", mime_type)?;
+        
+        // 💡 关键：强制浏览器在线渲染预览（inline），防止复制直链后变成强制下载！
+        headers.set("Content-Disposition", "inline")?;
+
         return Ok(Response::empty()?.with_headers(headers).with_status(302));
     }
 
-    // ⚡ 对于缩略图（size=thumb），依然完美保留你的 Cloudflare 边缘物理缓存机制！
+    // ⚡ 缩略图（size=thumb）继续完美走 Cloudflare 边缘物理缓存
     let cache_key = req.url()?.to_string();
     if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
         return Ok(cached_resp);
@@ -129,7 +141,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     Ok(response)
 }
 
-// 2. 物理永久彻底删除（原封不动保留你的逻辑）
+// 2. 物理永久彻底删除
 pub async fn delete_file(req: Request, env: Env, imageid: String) -> Result<Response> {
     let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
