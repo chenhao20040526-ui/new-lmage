@@ -159,7 +159,7 @@ export const AlbumDetail: React.FC = () => {
     }
   };
 
-  // 1. 相册内直接上传图片（集成自动 WebP->JPG 及 >3MB 自动压到 1280p）
+  // 1. 相册内直接上传图片（自动 WebP->JPG + 纯画质压制 + 复用 api.uploadFile）
   const handleDirectUploadFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const rawFiles = e.target.files;
     if (!rawFiles || rawFiles.length === 0 || !albumid) return;
@@ -177,15 +177,22 @@ export const AlbumDetail: React.FC = () => {
     for (let i = 0; i < files.length; i++) {
       setUploadStatus(`⚡ 正在处理与上传 (${i + 1}/${files.length}): ${files[i].name}...`);
       try {
-        // 前端自动压缩与转码
+        // 前端自动纯画质压制与 WebP 转 JPG
         const processedFile = await processImageBeforeUpload(files[i]);
         
-        // 调用上传接口
-        const formData = new FormData();
-        formData.append('file', processedFile);
-        const res = await api.uploadImage(formData); // 假设 api.uploadImage 存在
+        // 调用 api.uploadFile 自动上传并带入当前相册 id 归档
+        const res = await api.uploadFile(processedFile, albumid);
         
-        const imgId = res.id || res.data?.id;
+        // 兼容后端返回的数组结构 [{ src: '...' }] 或对象
+        let imgId = null;
+        if (Array.isArray(res) && res[0]) {
+          const item = res[0] as any;
+          imgId = item.id || item.file_id || (item.src ? item.src.split('/').pop()?.split('?')[0] : null);
+        } else if (res && typeof res === 'object') {
+          const obj = res as any;
+          imgId = obj.id || obj.file_id || obj.data?.id;
+        }
+
         if (imgId) {
           newImageIds.push(imgId);
           successCount++;
@@ -195,14 +202,14 @@ export const AlbumDetail: React.FC = () => {
       }
     }
 
-    if (newImageIds.length > 0) {
-      try {
-        await api.modifyAlbumImages(albumid, newImageIds, 'add');
+    // 重新拉取相册详情以同步最新图片列表
+    try {
+      await load(accessPwd || undefined);
+      if (successCount > 0) {
         toast.success(`成功上传并归档 ${successCount} 张图片！`);
-        await load(accessPwd || undefined);
-      } catch (err) {
-        toast.error('归档到相册失败');
       }
+    } catch (err) {
+      toast.error('刷新相册列表失败');
     }
 
     setUploading(false);
