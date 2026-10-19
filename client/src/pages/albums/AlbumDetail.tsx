@@ -233,7 +233,7 @@ export const AlbumDetail: React.FC = () => {
   };
 
   // 2. 一键发布到 Telegra.ph 并生成即时预览链接
-  const handlePublishToTelegraph = async () => {
+const handlePublishToTelegraph = async () => {
     if (!album || images.length === 0) {
       toast.warning('相册内暂无图片，无法生成 Telegra.ph 页面');
       return;
@@ -241,7 +241,12 @@ export const AlbumDetail: React.FC = () => {
 
     setTgPublishing(true);
     try {
-      const contentNodes = images.map((img) => ({
+      // 💡 关键修改：在发布前，对图片按文件名进行自然排序（完美解决 1, 2, 10 的排序错乱问题）
+      const sortedImages = [...images].sort((a, b) =>
+        a.file_name.localeCompare(b.file_name, undefined, { numeric: true, sensitivity: 'base' })
+      );
+
+      const contentNodes = sortedImages.map((img) => ({
         tag: 'figure',
         children: [{
           tag: 'img',
