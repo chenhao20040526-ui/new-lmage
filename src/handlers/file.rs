@@ -2,7 +2,7 @@ use crate::core::{cors, crypto, tg};
 use crate::domain::image;
 use worker::*;
 
-// 1. 图片代理网关（原图 302 直连 Telegram CDN + 强制内联预览，缩略图走 Cache API）
+// 1. 修复版流式图片代理网关（回归 200 OK 响应，完美适配 Telegra.ph IV 爬虫与前端网页渲染）
 pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Response> {
     let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
@@ -61,53 +61,25 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
+    // ⚡ 第一关：从 Cloudflare 边缘物理缓存中拿（支持持久缓存，大幅加速访问）
+    let cache_key = req.url()?.to_string();
+    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
+        return Ok(cached_resp);
+    }
+
     // 1) 向 TG 换取物理路径
     let file_path = match tg::get_file_path(&bot_token, &target_file_id).await {
         Ok(path) => path,
         Err(err) => return Response::error(err.to_string(), 404),
     };
 
-    // 2) 组装 TG 官方 CDN 真实直链地址
-    let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
+    // 2) 调取 Telegram 真实物理数据流
+    let mut cdn_resp = match tg::fetch_file_stream(&bot_token, &file_path).await {
+        Ok(res) => res,
+        Err(_) => return Response::error("从 TG 获取图片流失败", 502),
+    };
 
-    // 🚀 核心优化：原图请求直接 302 重定向到 Telegram CDN，彻底解决中转断流、半截图与 CPU 超时！
-    if !request_thumb {
-        if status_check_on && img_opt.is_some() {
-            let now = Date::now().as_millis() as i64;
-            let _ = image::increment_views(&db, &raw_file_id, now).await;
-        }
-
-        let mut headers = cors::apply_cors(Headers::new())?;
-        headers.set("Location", &tg_file_url)?;
-        headers.set("Cache-Control", "public, max-age=86400, s-maxage=86400")?;
-
-        // 动态匹配 Content-Type
-        let ext = filekey.split('.').last().unwrap_or("").to_lowercase();
-        let mime_type = match ext.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "svg" => "image/svg+xml",
-            "mp4" => "video/mp4",
-            "mp3" => "audio/mpeg",
-            _ => "application/octet-stream",
-        };
-        headers.set("Content-Type", mime_type)?;
-        
-        // 💡 关键：强制浏览器在线渲染预览（inline），防止复制直链后变成强制下载！
-        headers.set("Content-Disposition", "inline")?;
-
-        return Ok(Response::empty()?.with_headers(headers).with_status(302));
-    }
-
-    // ⚡ 缩略图（size=thumb）继续完美走 Cloudflare 边缘物理缓存
-    let cache_key = req.url()?.to_string();
-    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
-        return Ok(cached_resp);
-    }
-
-    let mut cdn_resp = tg::fetch_file_stream(&bot_token, &file_path).await?;
+    // 3) 组装标准的 200 OK 响应头，确保 Telegra.ph 爬虫与前端网页、JS fetch 完美兼容
     let res_headers = cors::apply_cors(Headers::new())?;
     res_headers.set(
         "Cache-Control",
@@ -127,15 +99,28 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         _ => "application/octet-stream",
     };
     res_headers.set("Content-Type", mime_type)?;
+    
+    // 💡 关键点：强制 inline（网页直接渲染，绝不触发强制下载）
+    res_headers.set("Content-Disposition", "inline")?;
 
+    // 4) 累计 Views (仅状态管理开启时统计)
+    if status_check_on && !request_thumb && img_opt.is_some() {
+        let now = Date::now().as_millis() as i64;
+        let _ = image::increment_views(&db, &raw_file_id, now).await;
+    }
+
+    // 5) 通过 Response 包装流并返回
     let stream = cdn_resp.stream()?;
     let mut response = Response::from_stream(stream)?.with_headers(res_headers);
 
-    if let Ok(resp_for_cache) = response.cloned() {
-        let cache_key_clone = cache_key.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let _ = Cache::default().put(cache_key_clone, resp_for_cache).await;
-        });
+    // 6) 异步写入缓存（带状态码校验：只有 200 成功的完整响应才允许写入 Cloudflare 缓存，防止坏图污染）
+    if response.status_code() == 200 {
+        if let Ok(resp_for_cache) = response.cloned() {
+            let cache_key_clone = cache_key.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = Cache::default().put(cache_key_clone, resp_for_cache).await;
+            });
+        }
     }
 
     Ok(response)
