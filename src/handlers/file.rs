@@ -69,8 +69,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         Err(err) => return Response::error(err.to_string(), 404),
     };
 
-    // 3) 💡 核心智能分流逻辑：
-    // 如果是普通网页用户（非爬虫、非缩略图请求），直接 302 重定向到 TG CDN！100+张图瞬间秒开，零卡顿！
+    // 3) 智能分流：如果是普通网页用户，直接 302 重定向到 TG CDN！100+张图瞬间秒开，零卡顿
     if !request_thumb && !is_telegram_crawler {
         let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
         let mut headers = cors::apply_cors(Headers::new())?;
@@ -78,22 +77,15 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         return Ok(Response::empty()?.with_headers(headers).with_status(302));
     }
 
-    // 4) 🤖 如果是 Telegram 爬虫：走流式代理（200 OK），确保 IV 预览生成成功
-    let cache_key = req.url()?.to_string();
-    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
-        return Ok(cached_resp);
-    }
-
+    // 4) 🤖 如果是 Telegram 爬虫：强制走流式代理（200 OK），禁用缓存和 304，确保每次都吐出完整数据
     let mut cdn_resp = match tg::fetch_file_stream(&bot_token, &file_path).await {
         Ok(res) => res,
         Err(_) => return Response::error("从 TG 获取图片流失败", 502),
     };
 
     let res_headers = cors::apply_cors(Headers::new())?;
-    res_headers.set(
-        "Cache-Control",
-        "public, s-maxage=31536000, max-age=31536000, immutable",
-    )?;
+    // 💡 关键修改：对爬虫禁用本地/边缘缓存，强制返回全新 200 OK 数据体，杜绝 304
+    res_headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")?;
     res_headers.set("X-Content-Type-Options", "nosniff")?;
 
     let ext = filekey.split('.').last().unwrap_or("").to_lowercase();
@@ -116,18 +108,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     }
 
     let stream = cdn_resp.stream()?;
-    let mut response = Response::from_stream(stream)?.with_headers(res_headers);
-
-    if response.status_code() == 200 {
-        if let Ok(resp_for_cache) = response.cloned() {
-            let cache_key_clone = cache_key.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = Cache::default().put(cache_key_clone, resp_for_cache).await;
-            });
-        }
-    }
-
-    Ok(response)
+    Ok(Response::from_stream(stream)?.with_headers(res_headers))
 }
 
 // 2. 物理永久彻底删除
