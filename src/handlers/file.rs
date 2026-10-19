@@ -59,9 +59,15 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // 1) 识别是否为 Telegram 官方爬虫（Instant View / 预览抓取）
-    let user_agent = req.headers().get("User-Agent")?.unwrap_or_default();
-    let is_telegram_crawler = user_agent.contains("TelegramBot") || user_agent.contains("InstantView");
+    // 1) 🛡️ 双重保险识别：同时检查 User-Agent 和 Referer
+    let user_agent = req.headers().get("User-Agent")?.unwrap_or_default().to_lowercase();
+    let referer = req.headers().get("Referer")?.unwrap_or_default();
+
+    let is_telegram_crawler = user_agent.contains("telegrambot") || user_agent.contains("instantview");
+    let is_telegram_iv_referer = referer.contains("ivwebcontent.telegram.org");
+
+    // 只要是 Telegram 官方的爬虫或者 IV 渲染容器，就统一判定为 Telegram 内部请求
+    let is_telegram_request = is_telegram_crawler || is_telegram_iv_referer;
 
     // 2) 向 TG 换取物理路径
     let file_path = match tg::get_file_path(&bot_token, &target_file_id).await {
@@ -69,22 +75,22 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         Err(err) => return Response::error(err.to_string(), 404),
     };
 
-    // 3) 智能分流：如果是普通网页用户，直接 302 重定向到 TG CDN！100+张图瞬间秒开，零卡顿
-    if !request_thumb && !is_telegram_crawler {
+    // 3) 智能分流：
+    // 如果不是缩略图，且 **不是** Telegram 的请求（即普通网页读者），直接 302 重定向到 TG CDN，100+张图瞬间秒开！
+    if !request_thumb && !is_telegram_request {
         let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
         let mut headers = cors::apply_cors(Headers::new())?;
         headers.set("Location", &tg_file_url)?;
         return Ok(Response::empty()?.with_headers(headers).with_status(302));
     }
 
-    // 4) 🤖 如果是 Telegram 爬虫：强制走流式代理（200 OK），禁用缓存和 304，确保每次都吐出完整数据
+    // 4) 🤖 如果是 Telegram 相关的抓取（爬虫或 IV 容器）：走 200 OK 流式代理，禁用缓存，确保稳定拿到完整二进制数据
     let mut cdn_resp = match tg::fetch_file_stream(&bot_token, &file_path).await {
         Ok(res) => res,
         Err(_) => return Response::error("从 TG 获取图片流失败", 502),
     };
 
     let res_headers = cors::apply_cors(Headers::new())?;
-    // 💡 关键修改：对爬虫禁用本地/边缘缓存，强制返回全新 200 OK 数据体，杜绝 304
     res_headers.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")?;
     res_headers.set("X-Content-Type-Options", "nosniff")?;
 
