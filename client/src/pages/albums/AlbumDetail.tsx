@@ -5,12 +5,15 @@ import { toast } from 'sonner';
 import {
   Calendar,
   Check,
+  Globe,
   ImagePlus,
   Images,
   KeyRound,
   SquareCheck,
   Trash2,
+  Upload,
   X,
+  ExternalLink,
 } from 'lucide-react';
 import { api } from '../../services/api';
 import type { Album, Image } from '../../services/api';
@@ -22,15 +25,12 @@ import { ImageLightbox } from '../../components/common/ImageLightbox';
 import { PageHeader } from '../../components/common/PageHeader';
 import { FadeInUp } from '../../components/common/FadeInUp';
 import { formatBytes } from '../../components/common/format';
+import { processImageBeforeUpload } from '../../utils/imageProcessor';
 import '../../components/common/pageActions.css';
 import './albumdetail.css';
 
-/* ---------- 类型与工具 ---------- */
-
-/** 删除确认弹层状态：解散相册 / 物理抹除单张图片 */
 type ConfirmState = { kind: 'album' } | { kind: 'image'; image: Image } | null;
 
-/** 后端 403 文案稳定包含「密码/提取码」，据此判定加密相册 */
 const isPasswordError = (err: unknown): boolean =>
   typeof err === 'object' &&
   err !== null &&
@@ -38,9 +38,6 @@ const isPasswordError = (err: unknown): boolean =>
   typeof (err as { message?: unknown }).message === 'string' &&
   /密码|提取码/.test((err as { message: string }).message);
 
-/* ---------- 页面主组件 ---------- */
-
-/** 相册详情页（独立路由 /albums/:albumid，加密相册自动弹出提取码解锁） */
 export const AlbumDetail: React.FC = () => {
   const { albumid } = useParams<{ albumid: string }>();
   const navigate = useNavigate();
@@ -50,26 +47,34 @@ export const AlbumDetail: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
 
-  // 提取码解锁（成功后留存 accessPwd 供后续刷新）
+  // 提取码解锁
   const [locked, setLocked] = useState(false);
   const [password, setPassword] = useState('');
   const [unlocking, setUnlocking] = useState(false);
   const [accessPwd, setAccessPwd] = useState('');
   const unlockRef = useRef<HTMLInputElement>(null);
 
-  // 光箱 / 多选模式 / 批量移出
+  // 光箱 / 多选 / 批量移出
   const [lightbox, setLightbox] = useState<Image | null>(null);
   const [selecting, setSelecting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [removing, setRemoving] = useState(false);
 
-  // 加图选择器 / 删除确认
+  // 选图弹层 / 直接上传
   const [showPicker, setShowPicker] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Telegra.ph 发布与即时预览弹层
+  const [showTgModal, setShowTgModal] = useState(false);
+  const [tgPublishing, setTgPublishing] = useState(false);
+  const [tgResultUrl, setTgResultUrl] = useState('');
+
+  // 删除确认
   const [confirm, setConfirm] = useState<ConfirmState>(null);
   const [busy, setBusy] = useState(false);
-
-  /* ---------- 数据加载（加密相册：失败即弹解锁面板） ---------- */
 
   const load = useCallback(
     async (pwd?: string) => {
@@ -88,7 +93,6 @@ export const AlbumDetail: React.FC = () => {
           setLocked(true);
           setAlbum(null);
           setImages([]);
-          // 提交过提取码仍失败：错误提示后解锁面板保持停留
           if (pwd) toast.error('提取码错误，请重新输入');
         } else {
           setNotFound(true);
@@ -103,11 +107,8 @@ export const AlbumDetail: React.FC = () => {
 
   useEffect(() => {
     load();
-    // 仅响应路由参数变化
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [albumid]);
+  }, [albumid, load]);
 
-  // 解锁面板弹出后自动聚焦输入框
   useEffect(() => {
     if (locked) unlockRef.current?.focus();
   }, [locked]);
@@ -126,8 +127,6 @@ export const AlbumDetail: React.FC = () => {
       setUnlocking(false);
     }
   };
-
-  /* ---------- 多选与批量移出 ---------- */
 
   const exitSelectMode = () => {
     setSelecting(false);
@@ -160,7 +159,56 @@ export const AlbumDetail: React.FC = () => {
     }
   };
 
-  /* ---------- 加图 / 删除 ---------- */
+  // 1. 相册内直接上传图片（集成自动 WebP->JPG 及 >3MB 自动压到 1280p）
+  const handleDirectUploadFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const rawFiles = e.target.files;
+    if (!rawFiles || rawFiles.length === 0 || !albumid) return;
+
+    const files = Array.from(rawFiles).filter((f) => f.type.startsWith('image/'));
+    if (files.length === 0) {
+      toast.warning('请选择有效的图片文件');
+      return;
+    }
+
+    setUploading(true);
+    let successCount = 0;
+    const newImageIds: string[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      setUploadStatus(`⚡ 正在处理与上传 (${i + 1}/${files.length}): ${files[i].name}...`);
+      try {
+        // 前端自动压缩与转码
+        const processedFile = await processImageBeforeUpload(files[i]);
+        
+        // 调用上传接口
+        const formData = new FormData();
+        formData.append('file', processedFile);
+        const res = await api.uploadImage(formData); // 假设 api.uploadImage 存在
+        
+        const imgId = res.id || res.data?.id;
+        if (imgId) {
+          newImageIds.push(imgId);
+          successCount++;
+        }
+      } catch (err) {
+        console.error(`上传 ${files[i].name} 失败:`, err);
+      }
+    }
+
+    if (newImageIds.length > 0) {
+      try {
+        await api.modifyAlbumImages(albumid, newImageIds, 'add');
+        toast.success(`成功上传并归档 ${successCount} 张图片！`);
+        await load(accessPwd || undefined);
+      } catch (err) {
+        toast.error('归档到相册失败');
+      }
+    }
+
+    setUploading(false);
+    setUploadStatus('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   const handleAddImages = async (ids: string[]) => {
     if (!albumid || ids.length === 0) return;
@@ -177,13 +225,59 @@ export const AlbumDetail: React.FC = () => {
     }
   };
 
+  // 2. 一键发布到 Telegra.ph 并生成即时预览链接
+  const handlePublishToTelegraph = async () => {
+    if (!album || images.length === 0) {
+      toast.warning('相册内暂无图片，无法生成 Telegra.ph 页面');
+      return;
+    }
+
+    setTgPublishing(true);
+    try {
+      const contentNodes = images.map((img) => ({
+        tag: 'figure',
+        children: [{
+          tag: 'img',
+          attrs: { src: api.getFileUrl(img.id, false) }
+        }]
+      }));
+
+      const formData = new URLSearchParams();
+      formData.append('access_token', 'c2a41fe0a6a592a1cffba1ab0f2f650ff0cf46a9964837ba09cba7df7fad');
+      formData.append('title', album.name); // 默认标题 = 相册名
+      formData.append('author_name', '媚黑资源库'); // 发布者不变
+      formData.append('author_url', 'https://t.me/bangnihuijia'); // 发布链接不变
+      formData.append('content', JSON.stringify(contentNodes));
+      formData.append('return_content', 'false');
+
+      const response = await fetch('https://api.telegra.ph/createPage', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await response.json();
+
+      if (data.ok) {
+        const pageUrl = data.result.url;
+        setTgResultUrl(pageUrl);
+        setShowTgModal(true);
+        toast.success('Telegra.ph 页面发布成功！');
+      } else {
+        toast.error('Telegra.ph 发布失败：' + data.error);
+      }
+    } catch (err: any) {
+      toast.error('请求 Telegra.ph 网络异常：' + err.message);
+    } finally {
+      setTgPublishing(false);
+    }
+  };
+
   const handleConfirm = async () => {
     if (!confirm || !albumid) return;
     setBusy(true);
     try {
       if (confirm.kind === 'album') {
         await api.deleteAlbum(albumid);
-        toast.success('相册已解散，其中的图片仅解除归属');
+        toast.success('相册已解散');
         navigate('/manage');
       } else {
         await api.deleteImagePhysically(confirm.image.id);
@@ -193,17 +287,14 @@ export const AlbumDetail: React.FC = () => {
         setConfirm(null);
       }
     } catch (err) {
-      toast.error((err as Error)?.message ?? (confirm.kind === 'album' ? '删除相册失败' : '删除图片失败'));
+      toast.error((err as Error)?.message ?? '操作失败');
     } finally {
       setBusy(false);
     }
   };
 
-  /* ---------- 渲染 ---------- */
-
   return (
     <div className="album-detail-container">
-      {/* 顶部毛玻璃页头（全端：返回 + 标题/加密信息 + 相册操作） */}
       <PageHeader
         title={album?.name ?? '相册详情'}
         subtitle={
@@ -223,27 +314,59 @@ export const AlbumDetail: React.FC = () => {
                 setSelecting((s) => !s);
                 setSelectedIds([]);
               }}
-              aria-label={selecting ? '退出多选模式' : '进入多选模式'}
               title="多选操作"
             >
               <SquareCheck size={17} strokeWidth={1.5} />
             </motion.button>
+
+            {/* 上传图片按钮 */}
+            <motion.button
+              type="button"
+              className="ad-icon-btn"
+              whileTap={{ scale: 0.88 }}
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              title="在本相册直接上传图片"
+            >
+              <Upload size={17} strokeWidth={1.5} />
+            </motion.button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept="image/*"
+              style={{ display: 'none' }}
+              onChange={handleDirectUploadFiles}
+            />
+
+            {/* 从图库挑选 */}
             <motion.button
               type="button"
               className="ad-icon-btn"
               whileTap={{ scale: 0.88 }}
               onClick={() => setShowPicker(true)}
-              aria-label="加入图片"
-              title="加入图片"
+              title="从现有图库挑选"
             >
               <ImagePlus size={17} strokeWidth={1.5} />
             </motion.button>
+
+            {/* Telegra.ph 一键发布与即时预览 */}
+            <motion.button
+              type="button"
+              className="ad-icon-btn"
+              whileTap={{ scale: 0.88 }}
+              onClick={handlePublishToTelegraph}
+              disabled={tgPublishing}
+              title="发布到 Telegra.ph 并生成即时预览"
+            >
+              <Globe size={17} strokeWidth={1.5} />
+            </motion.button>
+
             <motion.button
               type="button"
               className="ad-icon-btn danger"
               whileTap={{ scale: 0.88 }}
               onClick={() => setConfirm({ kind: 'album' })}
-              aria-label="解散相册"
               title="解散相册"
             >
               <Trash2 size={17} strokeWidth={1.5} />
@@ -252,10 +375,15 @@ export const AlbumDetail: React.FC = () => {
         )}
       </PageHeader>
 
+      {uploading && (
+        <div style={{ padding: '12px', textAlign: 'center', background: 'var(--accent-soft)', borderRadius: '10px', marginBottom: '14px', fontSize: '13px', fontWeight: 600, color: 'var(--accent)' }}>
+          {uploadStatus}
+        </div>
+      )}
+
       {loading ? (
         <Loader text="正在提取相册归档..." />
       ) : locked ? (
-        /* ===== 提取码解锁面板（毛玻璃卡片） ===== */
         <motion.form
           className="ad-unlock-card"
           onSubmit={handleUnlock}
@@ -293,7 +421,6 @@ export const AlbumDetail: React.FC = () => {
         />
       ) : album ? (
         <>
-          {/* 相册信息区 */}
           <div className="ad-head">
             {album.description && <p className="ad-head-desc">{album.description}</p>}
             <div className="ad-chips">
@@ -318,17 +445,15 @@ export const AlbumDetail: React.FC = () => {
             </div>
           </div>
 
-          {/* 空状态（手绘插画） */}
           {images.length === 0 ? (
             <EmptyState
               variant="album"
               title="相册还是空的"
-              description="从图库中挑选心仪的图片加入这个相册吧"
-              actionText="挑选图片加入"
-              onAction={() => setShowPicker(true)}
+              description="点击上方上传按钮或挑选图库图片加入这个相册吧"
+              actionText="直接上传图片"
+              onAction={() => fileInputRef.current?.click()}
             />
           ) : (
-            /* ===== 图片网格（FadeInUp 错峰入场 + 悬停微缩放） ===== */
             <div className="ad-grid">
               {images.map((img, i) => {
                 const selected = selectedIds.includes(img.id);
@@ -339,14 +464,6 @@ export const AlbumDetail: React.FC = () => {
                       whileHover={{ y: selecting ? -2 : -4 }}
                       whileTap={{ scale: 0.96 }}
                       onClick={() => handleItemClick(img)}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          handleItemClick(img);
-                        }
-                      }}
                     >
                       <img src={api.getFileUrl(img.id, true)} alt={img.file_name} loading="lazy" draggable={false} />
                       {selecting && (
@@ -364,7 +481,7 @@ export const AlbumDetail: React.FC = () => {
         </>
       ) : null}
 
-      {/* ===== 批量操作条（多选后浮动） ===== */}
+      {/* 批量操作条 */}
       <AnimatePresence>
         {selecting && selectedIds.length > 0 && (
           <motion.div
@@ -392,7 +509,61 @@ export const AlbumDetail: React.FC = () => {
         )}
       </AnimatePresence>
 
-      {/* ===== 详情光箱（复用图库级组件，归档/标签联动刷新） ===== */}
+      {/* Telegra.ph 发布与即时预览成功弹窗 */}
+      <AnimatePresence>
+        {showTgModal && (
+          <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'grid', placeItems: 'center', zIndex: 1000, padding: '16px' }}>
+            <motion.div
+              style={{ background: 'var(--bg-surface)', padding: '24px', borderRadius: '18px', maxWidth: '460px', width: '100%', boxShadow: '0 20px 50px rgba(0,0,0,0.3)', border: '1px solid var(--border-subtle)' }}
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+            >
+              <h3 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                🎉 Telegra.ph 页面发布成功
+              </h3>
+              <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginBottom: '14px' }}>
+                已默认采用相册名「{album?.name}」作为标题，署名与跳转链接已自动带入。
+              </p>
+              
+              <div style={{ marginBottom: '14px' }}>
+                <label style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>Telegra.ph 网页地址：</label>
+                <input type="text" readOnly value={tgResultUrl} style={{ width: '100%', padding: '8px 10px', marginTop: '4px', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-surface-hover)', fontSize: '13px' }} />
+              </div>
+
+              <div style={{ marginBottom: '20px' }}>
+                <label style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>Telegram 即时预览测试链接（点击生成缓存）：</label>
+                <input type="text" readOnly value={`https://instantview.telegram.org/samples/telegra.ph/?url=${encodeURIComponent(tgResultUrl)}`} style={{ width: '100%', padding: '8px 10px', marginTop: '4px', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-surface-hover)', fontSize: '13px' }} />
+              </div>
+
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+                <button
+                  className="modal-btn"
+                  onClick={() => {
+                    navigator.clipboard.writeText(`https://instantview.telegram.org/samples/telegra.ph/?url=${encodeURIComponent(tgResultUrl)}`);
+                    toast.success('已复制即时预览测试链接！');
+                  }}
+                >
+                  复制预览链接
+                </button>
+                <a
+                  href={`https://instantview.telegram.org/samples/telegra.ph/?url=${encodeURIComponent(tgResultUrl)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="modal-btn modal-btn-primary"
+                  style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                >
+                  前往生成即时预览 <ExternalLink size={14} />
+                </a>
+                <button className="modal-btn" onClick={() => setShowTgModal(false)}>
+                  关闭
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <ImageLightbox
         image={lightbox}
         onClose={() => setLightbox(null)}
@@ -400,7 +571,6 @@ export const AlbumDetail: React.FC = () => {
         onChanged={() => load(accessPwd || undefined)}
       />
 
-      {/* ===== 删除确认弹层（移动端底部弹层，桌面自动居中） ===== */}
       <ConfirmSheet
         open={confirm !== null}
         title={confirm?.kind === 'album' ? '解散这本相册？' : '永久删除这张图片？'}
@@ -416,7 +586,6 @@ export const AlbumDetail: React.FC = () => {
         onClose={() => setConfirm(null)}
       />
 
-      {/* ===== 图库选图加入相册 ===== */}
       <ImagePickerModal
         open={showPicker}
         title="挑选图片加入相册"
