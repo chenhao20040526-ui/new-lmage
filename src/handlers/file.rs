@@ -2,7 +2,6 @@ use crate::core::{cors, crypto, tg};
 use crate::domain::image;
 use worker::*;
 
-// 1. 修复版流式图片代理网关（回归 200 OK 响应，完美适配 Telegra.ph IV 爬虫与前端网页渲染）
 pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Response> {
     let db = env.d1("DB")?;
     let raw_bot_token = env.var("TG_Bot_Token")?.to_string();
@@ -16,7 +15,7 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
     let raw_file_id = filekey.split('.').next().unwrap_or(&filekey).to_string();
     let mut target_file_id = raw_file_id.clone();
 
-    // 缩略图元数据：内存缓存优先（30s），未命中查 D1 回填
+    // 缩略图元数据：内存缓存优先
     let img_opt = match crate::core::img_cache::get(&filekey) {
         Some(img) => Some(img),
         None => {
@@ -43,7 +42,6 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // 检查是否请求缩略图 (?size=thumb)
     let url = req.url()?;
     let mut request_thumb = false;
     for (k, v) in url.query_pairs() {
@@ -61,25 +59,36 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         }
     }
 
-    // ⚡ 第一关：从 Cloudflare 边缘物理缓存中拿（支持持久缓存，大幅加速访问）
-    let cache_key = req.url()?.to_string();
-    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
-        return Ok(cached_resp);
-    }
+    // 1) 识别是否为 Telegram 官方爬虫（Instant View / 预览抓取）
+    let user_agent = req.headers().get("User-Agent")?.unwrap_or_default();
+    let is_telegram_crawler = user_agent.contains("TelegramBot") || user_agent.contains("InstantView");
 
-    // 1) 向 TG 换取物理路径
+    // 2) 向 TG 换取物理路径
     let file_path = match tg::get_file_path(&bot_token, &target_file_id).await {
         Ok(path) => path,
         Err(err) => return Response::error(err.to_string(), 404),
     };
 
-    // 2) 调取 Telegram 真实物理数据流
+    // 3) 💡 核心智能分流逻辑：
+    // 如果是普通网页用户（非爬虫、非缩略图请求），直接 302 重定向到 TG CDN！100+张图瞬间秒开，零卡顿！
+    if !request_thumb && !is_telegram_crawler {
+        let tg_file_url = format!("https://api.telegram.org/file/bot{}/{}", bot_token, file_path);
+        let mut headers = cors::apply_cors(Headers::new())?;
+        headers.set("Location", &tg_file_url)?;
+        return Ok(Response::empty()?.with_headers(headers).with_status(302));
+    }
+
+    // 4) 🤖 如果是 Telegram 爬虫：走流式代理（200 OK），确保 IV 预览生成成功
+    let cache_key = req.url()?.to_string();
+    if let Ok(Some(cached_resp)) = Cache::default().get(&cache_key, true).await {
+        return Ok(cached_resp);
+    }
+
     let mut cdn_resp = match tg::fetch_file_stream(&bot_token, &file_path).await {
         Ok(res) => res,
         Err(_) => return Response::error("从 TG 获取图片流失败", 502),
     };
 
-    // 3) 组装标准的 200 OK 响应头，确保 Telegra.ph 爬虫与前端网页、JS fetch 完美兼容
     let res_headers = cors::apply_cors(Headers::new())?;
     res_headers.set(
         "Cache-Control",
@@ -99,21 +108,16 @@ pub async fn proxy_file(req: Request, env: Env, filekey: String) -> Result<Respo
         _ => "application/octet-stream",
     };
     res_headers.set("Content-Type", mime_type)?;
-    
-    // 💡 关键点：强制 inline（网页直接渲染，绝不触发强制下载）
     res_headers.set("Content-Disposition", "inline")?;
 
-    // 4) 累计 Views (仅状态管理开启时统计)
     if status_check_on && !request_thumb && img_opt.is_some() {
         let now = Date::now().as_millis() as i64;
         let _ = image::increment_views(&db, &raw_file_id, now).await;
     }
 
-    // 5) 通过 Response 包装流并返回
     let stream = cdn_resp.stream()?;
     let mut response = Response::from_stream(stream)?.with_headers(res_headers);
 
-    // 6) 异步写入缓存（带状态码校验：只有 200 成功的完整响应才允许写入 Cloudflare 缓存，防止坏图污染）
     if response.status_code() == 200 {
         if let Ok(resp_for_cache) = response.cloned() {
             let cache_key_clone = cache_key.clone();
